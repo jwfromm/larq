@@ -9,7 +9,7 @@ from tensorflow.python.training import distribution_strategy_context
 
 def log2(x):
     """Computes the base 2 logarithm on an input"""
-    tf.math.log(x) / tf.math.log(2.0)
+    return (tf.math.log(x) / tf.math.log(2.0))
 
 
 @tf.custom_gradient
@@ -90,10 +90,14 @@ def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
     return approximate_std, quantized_means
 
 
-def BatchNormalization(use_shiftnorm, *args, **kwargs):
+def BatchNormalization(
+    use_shiftnorm, bits, *args, previous_layer=None, shiftnorm_scale=1.0, **kwargs
+):
     """Helper function that returns either a shiftnorm or batchnorm layer."""
     if use_shiftnorm:
-        return ShiftNormalization(*args, **kwargs)
+        return ShiftNormalization(
+            bits, previous_layer, *args, shiftnorm_scale=shiftnorm_scale, **kwargs
+        )
     else:
         return keras.layers.BatchNormalization(*args, **kwargs)
 
@@ -161,12 +165,12 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, bits, previous_layer, **kwargs):
+    def __init__(self, bits, previous_layer, shiftnorm_scale=1.0, **kwargs):
         super(ShiftNormalization, self).__init__(**kwargs)
         self.bits = bits
         self.previous_layer = previous_layer
         self.binary_dense = isinstance(previous_layer, QuantDense)
-        self.extra_scale = self.scope.shiftnorm_scale
+        self.extra_scale = shiftnorm_scale
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -417,7 +421,12 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         broadcast_shape[self.axis[0]] = input_shape.dims[self.axis[0]].value
 
         def _broadcast(v):
-            if v is not None and len(v.shape) != ndims and reduction_axes != list(range(ndims - 1)):
+            if (
+                v is not None
+                and len(v.shape) != ndims
+                and reduction_axes != list(range(ndims - 1))
+                and not self.binary_dense
+            ):
                 return tf.reshape(v, broadcast_shape)
             return v
 
