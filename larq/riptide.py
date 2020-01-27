@@ -171,6 +171,8 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         self.previous_layer = previous_layer
         self.binary_dense = isinstance(previous_layer, QuantDense)
         self.extra_scale = shiftnorm_scale
+        self.scale = False
+        self.center = False
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
