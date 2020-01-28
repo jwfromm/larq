@@ -74,7 +74,13 @@ def compute_quantized_shiftnorm(
     # Now quantize each channel of mean appropriately
     quantized_means = FixedPointQuantize(mean, mean_scale, total_shift_bits, rescale)
 
-    return approximate_std, quantized_means
+    return approximate_std, quantized_means, (total_shift_bits + log2(std_factor))
+
+
+def quantize_residual(residual, total_bits, rescale=True):
+    """Quantizes the output of a shiftnorm layer so it can be used in a skip connection."""
+    scale = 1.0 + ((1.0 / (2.0 ** bits - 1.0)) * (1.0 - (1.0 / 2.0 ** total_bits)))
+    return FixedPointQuantize(residual, scale, total_bits, rescale)
 
 
 def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
@@ -84,10 +90,10 @@ def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
     epsilon = layer.epsilon
     variance = layer.weights[1].value()
     bits = layer.bits
-    approximate_std, quantized_means = compute_quantized_shiftnorm(
+    approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
         variance, mean, epsilon, latent_weights, extra_scale, bits, rescale
     )
-    return approximate_std, quantized_means
+    return approximate_std, quantized_means, total_bits
 
 
 def BatchNormalization(
@@ -165,11 +171,12 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, bits, previous_layer, shiftnorm_scale=1.0, **kwargs):
+    def __init__(self, bits, previous_layer, residual_output=False, shiftnorm_scale=1.0, **kwargs):
         super(ShiftNormalization, self).__init__(**kwargs)
         self.bits = bits
         self.previous_layer = previous_layer
         self.binary_dense = isinstance(previous_layer, QuantDense)
+        self.residual_output = residual_output
         self.extra_scale = shiftnorm_scale
         self.scale = False
         self.center = False
@@ -553,7 +560,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
 
         # Extract weights of preceding layer to calculate means.
         previous_weights = self.previous_layer.weights[0].value()
-        approximate_std, quantized_means = compute_quantized_shiftnorm(
+        approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
             variance,
             mean,
             self.epsilon,
@@ -565,6 +572,11 @@ class ShiftNormalization(keras.layers.BatchNormalization):
 
         outputs = inputs - quantized_means
         outputs = outputs * approximate_std
+
+        # If this output is going to be used in residual connections we need to quantize it with
+        # N + wb + sb bits and the appropriate scale, which uses the same formula as mean but with more bits.
+        if self.residual_output:
+            outputs = quantize_residual(outputs, total_bits, rescale=True)
 
         # If some components of the shape got lost due to adjustments, fix that.
         outputs.set_shape(input_shape)
