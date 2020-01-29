@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow import keras
+import larq as lq
 from larq.layers import QuantDense
 from tensorflow.python.keras import backend as K
 from tensorflow.python.keras.engine.base_layer import InputSpec
@@ -55,6 +56,30 @@ def get_quantize_bits(x):
     return approximate_mean, bits
 
 
+@lq.utils.register_keras_custom_object
+@lq.utils.set_precision(1)
+@tf.custom_gradient
+def XQuantize(x):
+    mean, bits = get_quantize_bits(x)
+    y = mean * bits
+
+    def grad_fn(dy):
+        # Use a larger gradient cutoff to allow weights to grow if needed.
+        # This can effect the scales based on the means of kernels.
+        # Likely has no significant effect though.
+        gradient_cutoff = 10.0
+        grad_mask = tf.cast(tf.abs(x) <= gradient_cutoff, tf.float32)
+        # Allow weights to move off away from 1 if needed.
+        leaky_grad_mask = tf.cast(
+            tf.logical_or(
+                tf.logical_and(x > gradient_cutoff, dy > 0),
+                tf.logical_and(x < -gradient_cutoff, dy < 0)), tf.float32)
+        dx = grad_mask * dy + 0.1 * leaky_grad_mask * dy
+        return [dx]
+
+    return y, grad_fn
+
+
 def compute_quantized_shiftnorm(
     variance, mean, epsilon, latent_weights, extra_scale, bits, rescale=True
 ):
@@ -77,7 +102,7 @@ def compute_quantized_shiftnorm(
     return approximate_std, quantized_means, (total_shift_bits + log2(std_factor))
 
 
-def quantize_residual(residual, total_bits, rescale=True):
+def quantize_residual(residual, bits, total_bits, rescale=True):
     """Quantizes the output of a shiftnorm layer so it can be used in a skip connection."""
     scale = 1.0 + ((1.0 / (2.0 ** bits - 1.0)) * (1.0 - (1.0 / 2.0 ** total_bits)))
     return FixedPointQuantize(residual, scale, total_bits, rescale)
@@ -180,6 +205,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         self.extra_scale = shiftnorm_scale
         self.scale = False
         self.center = False
+        self.fused = False
 
     def build(self, input_shape):
         input_shape = tf.TensorShape(input_shape)
@@ -218,35 +244,12 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         if self.adjustment is not None:
             raise ValueError("When using virtual_batch_size, adjustment cannot " "be specified")
 
-        if self.fused in (None, True):
-            # TODO(yaozhang): if input is not 4D, reshape it to 4D and reshape the
-            # output back to its original shape accordingly.
-            if self._USE_V2_BEHAVIOR:
-                if self.fused is None:
-                    self.fused = ndims == 4
-            elif self.fused and ndims != 4:
-                raise ValueError(
-                    "Batch normalization layers with fused=True only " "support 4D input tensors."
-                )
-        else:
-            assert self.fused is not None
-            self.fused = ndims == 4 and self._fused_can_be_used()
         # TODO(chrisying): fused batch norm is currently not supported for
         # multi-axis batch norm and by extension virtual batches. In some cases,
         # it might be possible to use fused batch norm but would require reshaping
         # the Tensor to 4D with the axis in 1 or 3 (preferred 1) which is
         # particularly tricky. A compromise might be to just support the most
         # common use case (turning 5D w/ virtual batch to NCHW)
-
-        if self.fused:
-            if self.axis == [1]:
-                self._data_format = "NCHW"
-            elif self.axis == [3]:
-                self._data_format = "NHWC"
-            else:
-                raise ValueError(
-                    "Unsupported axis, fused batch norm only supports " "axis == [1] or axis == [3]"
-                )
 
         axis_to_dim = {x: input_shape.dims[x].value for x in self.axis}
         for x in axis_to_dim:
@@ -281,9 +284,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             )
         else:
             self.gamma = None
-            if self.fused:
-                self._gamma_const = K.constant(1.0, dtype=self._param_dtype, shape=param_shape)
-
+            
         if self.center:
             self.beta = self.add_weight(
                 name="beta",
@@ -297,9 +298,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             )
         else:
             self.beta = None
-            if self.fused:
-                self._beta_const = K.constant(0.0, dtype=self._param_dtype, shape=param_shape)
-
+            
         try:
             # Disable variable partitioning when creating the moving mean and variance
             if hasattr(self, "_scope") and self._scope:
@@ -403,14 +402,6 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             def undo_virtual_batching(outputs):
                 outputs = tf.reshape(outputs, original_shape)
                 return outputs
-
-        if self.fused:
-            outputs = self._fused_batch_norm(inputs, training=training)
-            if self.virtual_batch_size is not None:
-                # Currently never reaches here since fused_batch_norm does not support
-                # virtual batching
-                outputs = undo_virtual_batching(outputs)
-            return outputs
 
         # Compute the axes along which to reduce the mean / variance
         input_shape = inputs.shape
@@ -576,7 +567,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         # If this output is going to be used in residual connections we need to quantize it with
         # N + wb + sb bits and the appropriate scale, which uses the same formula as mean but with more bits.
         if self.residual_output:
-            outputs = quantize_residual(outputs, total_bits, rescale=True)
+            outputs = quantize_residual(outputs, self.bits, total_bits, rescale=True)
 
         # If some components of the shape got lost due to adjustments, fix that.
         outputs.set_shape(input_shape)
