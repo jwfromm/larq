@@ -97,12 +97,12 @@ def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
 
 
 def BatchNormalization(
-    use_shiftnorm, bits, *args, previous_layer=None, shiftnorm_scale=1.0, **kwargs
+    use_shiftnorm, bits, *args, previous_layer=None, residual_output=False, shiftnorm_scale=1.0, **kwargs
 ):
     """Helper function that returns either a shiftnorm or batchnorm layer."""
     if use_shiftnorm:
         return ShiftNormalization(
-            bits, previous_layer, *args, shiftnorm_scale=shiftnorm_scale, **kwargs
+            bits, previous_layer, *args, residual_output=residual_output, shiftnorm_scale=shiftnorm_scale, **kwargs
         )
     else:
         return keras.layers.BatchNormalization(*args, **kwargs)
