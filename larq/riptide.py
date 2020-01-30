@@ -81,7 +81,7 @@ def XQuantize(x):
 
 
 def compute_quantized_shiftnorm(
-    variance, mean, epsilon, latent_weights, extra_scale, bits, rescale=True
+    variance, mean, epsilon, latent_weights, extra_scale, bits, offset=None, scale=None, rescale=True
 ):
     """Computes approximated shiftnorm deviation and mean."""
     # Compute number of bits to shift for std division.
@@ -91,15 +91,26 @@ def compute_quantized_shiftnorm(
     weight_scale_ap2, _ = get_quantize_bits(latent_weights)
     weight_scale_bits = -log2(weight_scale_ap2)
     weight_scale_bits = tf.reshape(weight_scale_bits, [-1])
-    total_shift_bits = weight_scale_bits + bits
+    shift_bits = weight_scale_bits + bits
 
     # Determine quantization scale based on geometric series.
     mean_scale = 1.0 + ((1.0 / (2.0 ** bits - 1.0)) * (1.0 - (1.0 / 2.0 ** weight_scale_bits)))
 
     # Now quantize each channel of mean appropriately
-    quantized_means = FixedPointQuantize(mean, mean_scale, total_shift_bits, rescale)
+    quantized_means = FixedPointQuantize(mean, mean_scale, shift_bits, rescale)
 
-    return approximate_std, quantized_means, (total_shift_bits + log2(std_factor))
+    total_bits = shift_bits - log2(approximate_std)
+
+    # Calculate approximate scale and offset as well if specified.
+    if offset is not None:
+        quantized_offset = FixedPointQuantize(offset, mean_scale, shift_bits, rescale)
+        quantized_means = quantized_means - quantized_offset
+    if scale is not None:
+        approximate_scale = AP2(scale)
+        approximate_std = approximate_std * approximate_scale
+        total_bits = total_bits - log2(approximate_scale)
+
+    return approximate_std, quantized_means, total_bits
 
 
 def quantize_residual(residual, bits, total_bits, rescale=True):
@@ -203,8 +214,6 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         self.binary_dense = isinstance(previous_layer, QuantDense)
         self.residual_output = residual_output
         self.extra_scale = shiftnorm_scale
-        self.scale = False
-        self.center = False
         self.fused = False
 
     def build(self, input_shape):
@@ -558,6 +567,8 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             previous_weights,
             self.extra_scale,
             self.bits,
+            offset=offset,
+            scale=scale,
             rescale=True,
         )
 
