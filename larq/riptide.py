@@ -10,7 +10,7 @@ from tensorflow.python.training import distribution_strategy_context
 
 def log2(x):
     """Computes the base 2 logarithm on an input"""
-    return (tf.math.log(x) / tf.math.log(2.0))
+    return tf.math.log(x) / tf.math.log(2.0)
 
 
 @tf.custom_gradient
@@ -40,55 +40,39 @@ def FixedPointQuantize(inputs, scale, bits, rescale):
     return y, grad_fn
 
 
-def get_quantize_bits(x):
-    """Computes approximate mean and 1-bit value for an input weight tensor."""
-    if len(x.shape) > 2:
-        mean = tf.reduce_mean(tf.abs(tf.reshape(x, [-1, x.shape[-1]])), axis=0)
-    else:
-        mean = tf.reduce_mean(tf.abs(x))
-
-    # Fix dimensions of mean if needed
-    for i in range(len(x.shape) - 1):
-        mean = tf.expand_dims(mean, axis=0)
-    bits = tf.cast(x >= 0, tf.float32)
-    bits = (2 * bits) - 1
-    approximate_mean = AP2(mean)
-    return approximate_mean, bits
-
-
 @lq.utils.register_keras_custom_object
 @lq.utils.set_precision(1)
-@tf.custom_gradient
-def XQuantize(x):
-    mean, bits = get_quantize_bits(x)
-    y = mean * bits
+def magnitude_aware_sign_unclipped(x):
+    """
+    Scaled sign function with identity pseudo-gradient as used for the
+    weights in DoReFa and XNORNet papers. The Scale factor is calculated per layer.
+    """
+    scale_factor = tf.stop_gradient(tf.reduce_mean(tf.abs(x)))
 
-    def grad_fn(dy):
-        # Use a larger gradient cutoff to allow weights to grow if needed.
-        # This can effect the scales based on the means of kernels.
-        # Likely has no significant effect though.
-        gradient_cutoff = 10.0
-        grad_mask = tf.cast(tf.abs(x) <= gradient_cutoff, tf.float32)
-        # Allow weights to move off away from 1 if needed.
-        leaky_grad_mask = tf.cast(
-            tf.logical_or(
-                tf.logical_and(x > gradient_cutoff, dy > 0),
-                tf.logical_and(x < -gradient_cutoff, dy < 0)), tf.float32)
-        dx = grad_mask * dy + 0.1 * leaky_grad_mask * dy
-        return [dx]
+    @tf.custom_gradient
+    def _magnitude_aware_sign(x):
+        return lq.math.sign(x) * scale_factor, lambda dy: dy
 
-    return y, grad_fn
+    return _magnitude_aware_sign(x)
 
 
 def compute_quantized_shiftnorm(
-    variance, mean, epsilon, latent_weights, extra_scale, bits, offset=None, scale=None, rescale=True
+    variance,
+    mean,
+    epsilon,
+    latent_weights,
+    extra_scale,
+    bits,
+    offset=None,
+    scale=None,
+    rescale=True,
 ):
     """Computes approximated shiftnorm deviation and mean."""
     # Compute number of bits to shift for std division.
     std_factor = 1.0 / (extra_scale * tf.sqrt(variance + epsilon))
     approximate_std = AP2(std_factor)
     # Now determine total number of bits needed for fixed point quantization of mean.
-    weight_scale_ap2, _ = get_quantize_bits(latent_weights)
+    weight_scale_ap2 = AP2(tf.reduce_mean(tf.abs(latent_weights)))
     weight_scale_bits = -log2(weight_scale_ap2)
     weight_scale_bits = tf.reshape(weight_scale_bits, [-1])
     shift_bits = weight_scale_bits + bits
@@ -133,12 +117,23 @@ def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
 
 
 def BatchNormalization(
-    use_shiftnorm, bits, *args, previous_layer=None, residual_output=False, shiftnorm_scale=1.0, **kwargs
+    use_shiftnorm,
+    bits,
+    *args,
+    previous_layer=None,
+    residual_output=False,
+    shiftnorm_scale=1.0,
+    **kwargs
 ):
     """Helper function that returns either a shiftnorm or batchnorm layer."""
     if use_shiftnorm:
         return ShiftNormalization(
-            bits, previous_layer, *args, residual_output=residual_output, shiftnorm_scale=shiftnorm_scale, **kwargs
+            bits,
+            previous_layer,
+            *args,
+            residual_output=residual_output,
+            shiftnorm_scale=shiftnorm_scale,
+            **kwargs
         )
     else:
         return keras.layers.BatchNormalization(*args, **kwargs)
@@ -293,7 +288,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             )
         else:
             self.gamma = None
-            
+
         if self.center:
             self.beta = self.add_weight(
                 name="beta",
@@ -307,7 +302,7 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             )
         else:
             self.beta = None
-            
+
         try:
             # Disable variable partitioning when creating the moving mean and variance
             if hasattr(self, "_scope") and self._scope:
