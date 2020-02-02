@@ -178,198 +178,11 @@ class BatchNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, latent_weights, bits, use_shiftnorm=True, residual_output=False, shiftnorm_scale=1.0, **kwargs):
+    def __init__(self, bits, use_shiftnorm=True, **kwargs):
         super(BatchNormalization, self).__init__(**kwargs)
-        self.latent_weights = latent_weights
-        self.binary_dense = len(latent_weights.shape) == 2
         self.bits = bits
         self.use_shiftnorm = use_shiftnorm
-        self.residual_output = residual_output
-        self.extra_scale = shiftnorm_scale
         self.fused = False
-
-    def build(self, input_shape):
-        if not self.use_shiftnorm:
-            super(BatchNormalization, self).build(input_shape)
-            return
-        input_shape = tf.TensorShape(input_shape)
-        if not input_shape.ndims:
-            raise ValueError("Input has undefined rank:", input_shape)
-        ndims = len(input_shape)
-
-        # Convert axis to list and resolve negatives
-        if isinstance(self.axis, int):
-            self.axis = [self.axis]
-
-        for idx, x in enumerate(self.axis):
-            if x < 0:
-                self.axis[idx] = ndims + x
-
-        # Validate axes
-        for x in self.axis:
-            if x < 0 or x >= ndims:
-                raise ValueError("Invalid axis: %d" % x)
-        if len(self.axis) != len(set(self.axis)):
-            raise ValueError("Duplicate axis: %s" % self.axis)
-
-        if self.virtual_batch_size is not None:
-            if self.virtual_batch_size <= 0:
-                raise ValueError(
-                    "virtual_batch_size must be a positive integer that "
-                    "divides the true batch size of the input Tensor"
-                )
-            # If using virtual batches, the first dimension must be the batch
-            # dimension and cannot be the batch norm axis
-        if 0 in self.axis:
-            raise ValueError(
-                "When using virtual_batch_size, the batch dimension "
-                "must be 0 and thus axis cannot include 0"
-            )
-        if self.adjustment is not None:
-            raise ValueError("When using virtual_batch_size, adjustment cannot " "be specified")
-
-        # TODO(chrisying): fused batch norm is currently not supported for
-        # multi-axis batch norm and by extension virtual batches. In some cases,
-        # it might be possible to use fused batch norm but would require reshaping
-        # the Tensor to 4D with the axis in 1 or 3 (preferred 1) which is
-        # particularly tricky. A compromise might be to just support the most
-        # common use case (turning 5D w/ virtual batch to NCHW)
-
-        axis_to_dim = {x: input_shape.dims[x].value for x in self.axis}
-        for x in axis_to_dim:
-            if axis_to_dim[x] is None:
-                raise ValueError("Input has undefined `axis` dimension. Input shape: ", input_shape)
-        self.input_spec = InputSpec(ndim=ndims, axes=axis_to_dim)
-
-        if self.binary_dense:
-            param_shape = [1]
-        elif len(axis_to_dim) == 1 and self.virtual_batch_size is None:
-            # Single axis batch norm (most common/default use-case)
-            param_shape = (list(axis_to_dim.values())[0],)
-        else:
-            # Parameter shape is the original shape but with 1 in all non-axis dims
-            param_shape = [axis_to_dim[i] if i in axis_to_dim else 1 for i in range(ndims)]
-            if self.virtual_batch_size is not None:
-                # When using virtual batches, add an extra dim at index 1
-                param_shape.insert(1, 1)
-                for idx, x in enumerate(self.axis):
-                    self.axis[idx] = x + 1  # Account for added dimension
-
-        if self.scale:
-            self.gamma = self.add_weight(
-                name="gamma",
-                shape=param_shape,
-                dtype=self._param_dtype,
-                initializer=self.gamma_initializer,
-                regularizer=self.gamma_regularizer,
-                constraint=self.gamma_constraint,
-                trainable=True,
-                experimental_autocast=False,
-            )
-        else:
-            self.gamma = None
-
-        if self.center:
-            self.beta = self.add_weight(
-                name="beta",
-                shape=param_shape,
-                dtype=self._param_dtype,
-                initializer=self.beta_initializer,
-                regularizer=self.beta_regularizer,
-                constraint=self.beta_constraint,
-                trainable=True,
-                experimental_autocast=False,
-            )
-        else:
-            self.beta = None
-
-        try:
-            # Disable variable partitioning when creating the moving mean and variance
-            if hasattr(self, "_scope") and self._scope:
-                partitioner = self._scope.partitioner
-                self._scope.set_partitioner(None)
-            else:
-                partitioner = None
-
-            self.moving_mean = self.add_weight(
-                name="moving_mean",
-                shape=param_shape,
-                dtype=self._param_dtype,
-                initializer=self.moving_mean_initializer,
-                synchronization=tf.VariableSynchronization.ON_READ,
-                trainable=False,
-                aggregation=tf.VariableAggregation.MEAN,
-                experimental_autocast=False,
-            )
-
-            self.moving_variance = self.add_weight(
-                name="moving_variance",
-                shape=param_shape,
-                dtype=self._param_dtype,
-                initializer=self.moving_variance_initializer,
-                synchronization=tf.VariableSynchronization.ON_READ,
-                trainable=False,
-                aggregation=tf.VariableAggregation.MEAN,
-                experimental_autocast=False,
-            )
-
-            if self.renorm:
-                # In batch renormalization we track the inference moving stddev instead
-                # of the moving variance to more closely align with the paper.
-                def moving_stddev_initializer(*args, **kwargs):
-                    return tf.math.sqrt(self.moving_variance_initializer(*args, **kwargs))
-
-                with distribution_strategy_context.get_strategy().extended.colocate_vars_with(
-                    self.moving_variance
-                ):
-                    self.moving_stddev = self.add_weight(
-                        name="moving_stddev",
-                        shape=param_shape,
-                        dtype=self._param_dtype,
-                        initializer=moving_stddev_initializer,
-                        synchronization=tf.VariableSynchronization.ON_READ,
-                        trainable=False,
-                        aggregation=tf.VariableAggregation.MEAN,
-                        experimental_autocast=False,
-                    )
-
-                # Create variables to maintain the moving mean and standard deviation.
-                # These are used in training and thus are different from the moving
-                # averages above. The renorm variables are colocated with moving_mean
-                # and moving_stddev.
-                # NOTE: below, the outer `with device` block causes the current device
-                # stack to be cleared. The nested ones use a `lambda` to set the desired
-                # device and ignore any devices that may be set by the custom getter.
-                def _renorm_variable(name, shape, initializer=tf.zeros_initializer()):
-                    """Create a renorm variable."""
-                    var = self.add_weight(
-                        name=name,
-                        shape=shape,
-                        dtype=self._param_dtype,
-                        initializer=initializer,
-                        synchronization=tf.VariableSynchronization.ON_READ,
-                        trainable=False,
-                        aggregation=tf.VariableAggregation.MEAN,
-                        experimental_autocast=False,
-                    )
-                    return var
-
-                with distribution_strategy_context.get_strategy().extended.colocate_vars_with(
-                    self.moving_mean
-                ):
-                    self.renorm_mean = _renorm_variable(
-                        "renorm_mean", param_shape, self.moving_mean_initializer
-                    )
-                with distribution_strategy_context.get_strategy().extended.colocate_vars_with(
-                    self.moving_stddev
-                ):
-                    self.renorm_stddev = _renorm_variable(
-                        "renorm_stddev", param_shape, moving_stddev_initializer
-                    )
-        finally:
-            if partitioner:
-                self._scope.set_partitioner(partitioner)
-        self.built = True
 
     def call(self, inputs, training=None):
         # Unpack inputs.
@@ -394,12 +207,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
         # Compute the axes along which to reduce the mean / variance
         input_shape = inputs.shape
         ndims = len(input_shape)
-        # For dense layers, require a full reduction
-        if self.binary_dense:
-            reduction_axes = [i for i in range(ndims)]
-        # Otherwise, reduce all but the feature axis
-        else:
-            reduction_axes = [i for i in range(ndims) if i not in self.axis]
+        reduction_axes = [i for i in range(ndims) if i not in self.axis]
         if self.virtual_batch_size is not None:
             del reduction_axes[1]  # Do not reduce along virtual batch dim
 
@@ -413,7 +221,6 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 v is not None
                 and len(v.shape) != ndims
                 and reduction_axes != list(range(ndims - 1))
-                and not self.binary_dense
             ):
                 return tf.reshape(v, broadcast_shape)
             return v
@@ -452,11 +259,6 @@ class BatchNormalization(keras.layers.BatchNormalization):
             mean, variance = self._moments(
                 tf.cast(inputs, self._param_dtype), reduction_axes, keep_dims=keep_dims
             )
-
-            # When norming the output of a binary dense layer, make sure the shape is maintained.
-            if self.binary_dense:
-                mean = tf.reshape(mean, [1])
-                variance = tf.reshape(variance, [1])
 
             moving_mean = self.moving_mean
             moving_variance = self.moving_variance
@@ -537,31 +339,21 @@ class BatchNormalization(keras.layers.BatchNormalization):
         if scale is not None:
             scale = tf.cast(scale, inputs.dtype)
 
-        # Extract weights of preceding layer to calculate means.
-        #approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
-        #    variance,
-        #    mean,
-        #    self.epsilon,
-        #    tf.stop_gradient(self.latent_weights),
-        #    self.extra_scale,
-        #    self.bits,
-        #    offset=offset,
-        #    scale=scale,
-        #    rescale=True,
-        #)
+        std = tf.sqrt(variance + self.epsilon)
 
-        #outputs = inputs - quantized_means
-        #outputs = outputs * approximate_std
-        outputs = ((inputs - _broadcast(mean)) / tf.sqrt(_broadcast(variance) + self.epsilon))
         if scale is not None:
-            outputs = outputs * scale
-        if offset is not None:
-            outputs = outputs + offset
+            std = std / scale
 
-        # If this output is going to be used in residual connections we need to quantize it with
-        # N + wb + sb bits and the appropriate scale, which uses the same formula as mean but with more bits.
-        if self.residual_output:
-            outputs = quantize_residual(outputs, self.bits, total_bits, rescale=True)
+        if offset is not None:
+            adjusted_offset = offset * std
+            mean = mean - adjusted_offset
+        
+        # Quantize std and mean.
+        std = 1 / std
+        std = AP2(std)
+        mean = tf.round(mean)
+
+        outputs = (inputs - _broadcast(mean)) * _broadcast(std)
 
         # If some components of the shape got lost due to adjustments, fix that.
         outputs.set_shape(input_shape)
