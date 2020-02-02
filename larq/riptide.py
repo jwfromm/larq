@@ -14,6 +14,11 @@ def log2(x):
 
 
 @tf.custom_gradient
+def smooth_round(x):
+    return tf.round(x), lambda dy: dy
+
+
+@tf.custom_gradient
 def AP2(x):
     """Returns the approximate power of 2 of the input."""
     return 2 ** (tf.round(log2(tf.abs(x)))), lambda dy: dy
@@ -351,7 +356,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
         # Quantize std and mean.
         std = 1 / std
         std = AP2(std)
-        mean = tf.round(mean)
+        mean = smooth_round(mean)
 
         outputs = (inputs - _broadcast(mean)) * _broadcast(std)
 
