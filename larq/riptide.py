@@ -116,30 +116,7 @@ def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
     return approximate_std, quantized_means, total_bits
 
 
-def BatchNormalization(
-    use_shiftnorm,
-    bits,
-    *args,
-    previous_layer=None,
-    residual_output=False,
-    shiftnorm_scale=1.0,
-    **kwargs
-):
-    """Helper function that returns either a shiftnorm or batchnorm layer."""
-    if use_shiftnorm:
-        return ShiftNormalization(
-            bits,
-            previous_layer,
-            *args,
-            residual_output=residual_output,
-            shiftnorm_scale=shiftnorm_scale,
-            **kwargs
-        )
-    else:
-        return keras.layers.BatchNormalization(*args, **kwargs)
-
-
-class ShiftNormalization(keras.layers.BatchNormalization):
+class BatchNormalization(keras.layers.BatchNormalization):
     """Shift normalization layer
 
     Normalize the activations of the previous layer at each batch,
@@ -147,15 +124,14 @@ class ShiftNormalization(keras.layers.BatchNormalization):
     close to 0 and the activation standard deviation close to 1.
 
     Arguments:
-    previous_layer: The keras layer that precedes this one.
+    latent_weights: Tensor, the weights of the previous layer.
+    bits: Integer, How many bits activations are quantized with.
+    use_shiftnorm: Bool, whether to use shiftnorm or regular batchnorm.
     axis: Integer, the axis that should be normalized
         (typically the features axis).
         For instance, after a `Conv2D` layer with
         `data_format="channels_first"`,
         set `axis=1` in `BatchNormalization`.
-    binary_dense: Set true when using after a binary dense layer.
-        Need some special handling for batchnorm for binary dense layers to
-        prevent small variance.
     momentum: Momentum for the moving average.
     epsilon: Small float added to variance to avoid dividing by zero.
     center: If True, add offset of `beta` to normalized tensor.
@@ -202,16 +178,20 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, bits, previous_layer, residual_output=False, shiftnorm_scale=1.0, **kwargs):
-        super(ShiftNormalization, self).__init__(**kwargs)
+    def __init__(self, latent_weights, bits, use_shiftnorm=True, residual_output=False, shiftnorm_scale=1.0, **kwargs):
+        super(BatchNormalization, self).__init__(**kwargs)
+        self.latent_weights = latent_weights
+        self.binary_dense = len(latent_weights.shape) == 2
         self.bits = bits
-        self.previous_layer = previous_layer
-        self.binary_dense = isinstance(previous_layer, QuantDense)
+        self.use_shiftnorm = use_shiftnorm
         self.residual_output = residual_output
         self.extra_scale = shiftnorm_scale
         self.fused = False
 
     def build(self, input_shape):
+        if not self.use_shiftnorm:
+            super(BatchNormalization, self).build(input_shape)
+            return
         input_shape = tf.TensorShape(input_shape)
         if not input_shape.ndims:
             raise ValueError("Input has undefined rank:", input_shape)
@@ -392,6 +372,10 @@ class ShiftNormalization(keras.layers.BatchNormalization):
         self.built = True
 
     def call(self, inputs, training=None):
+        # Unpack inputs.
+        if not self.use_shiftnorm:
+            return super(BatchNormalization, self).call(inputs, training)
+
         training = self._get_training_value(training)
 
         if self.virtual_batch_size is not None:
@@ -554,21 +538,25 @@ class ShiftNormalization(keras.layers.BatchNormalization):
             scale = tf.cast(scale, inputs.dtype)
 
         # Extract weights of preceding layer to calculate means.
-        previous_weights = self.previous_layer.weights[0].value()
-        approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
-            variance,
-            mean,
-            self.epsilon,
-            previous_weights,
-            self.extra_scale,
-            self.bits,
-            offset=offset,
-            scale=scale,
-            rescale=True,
-        )
+        #approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
+        #    variance,
+        #    mean,
+        #    self.epsilon,
+        #    tf.stop_gradient(self.latent_weights),
+        #    self.extra_scale,
+        #    self.bits,
+        #    offset=offset,
+        #    scale=scale,
+        #    rescale=True,
+        #)
 
-        outputs = inputs - quantized_means
-        outputs = outputs * approximate_std
+        #outputs = inputs - quantized_means
+        #outputs = outputs * approximate_std
+        outputs = ((inputs - _broadcast(mean)) / tf.sqrt(_broadcast(variance) + self.epsilon))
+        if scale is not None:
+            outputs = outputs * scale
+        if offset is not None:
+            outputs = outputs + offset
 
         # If this output is going to be used in residual connections we need to quantize it with
         # N + wb + sb bits and the appropriate scale, which uses the same formula as mean but with more bits.
