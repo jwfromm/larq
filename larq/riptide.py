@@ -335,7 +335,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
         # Quantize std and mean.
         std = 1 / std
         std = AP2(std)
-        mean = ((2**self.bits - 1) * smooth_round(mean)) / (2 ** self.bits - 1)
+        mean = smooth_round((2**self.bits - 1) * mean) / (2 ** self.bits - 1)
 
         outputs = (inputs - _broadcast(mean)) * _broadcast(std)
 
