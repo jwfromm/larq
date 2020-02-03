@@ -1,7 +1,9 @@
 import tensorflow as tf
 from tensorflow import keras
 import larq as lq
+from larq import utils
 from larq.layers import QuantDense
+from larq.quantizers import QuantizerFunctionWrapper
 from tensorflow.python.keras import backend as K
 from tensorflow.python.keras.engine.base_layer import InputSpec
 from tensorflow.python.keras.utils import tf_utils
@@ -24,101 +26,76 @@ def AP2(x):
     return 2 ** (tf.round(log2(tf.abs(x)))), lambda dy: dy
 
 
-@tf.custom_gradient
-def FixedPointQuantize(inputs, scale, bits, rescale):
-    """Apply fixed point quantization to an input tensor."""
-    # Clip values into specified range
-    y = tf.clip_by_value(inputs, -scale, scale)
-    # Determine floating point value for each bit
-    bit_value = scale / (2.0 ** bits - 1.0)
-    # Quantize tensor
-    y = y / bit_value
-    y = tf.round(y)
-    # Readjust to floating point if specified
-    y = tf.cond(rescale, true_fn=lambda: y * bit_value, false_fn=lambda: y)
+def _clipped_gradient(x, dy, clip_value, unipolar):
+    if clip_value is None:
+        return dy
 
-    def grad_fn(dy):
-        grad_mask = tf.cast(tf.abs(inputs) <= scale, tf.float32)
-        dx = grad_mask * dy
-        return [dx, None, None, None]
-
-    return y, grad_fn
+    zeros = tf.zeros_like(dy)
+    if not unipolar:
+        x = tf.math.abs(x)
+    mask = tf.math.less_equal(x, clip_value)
+    if unipolar:
+        mask = tf.math.logical_and(mask, tf.math.greater_equal(x, 0))
+    return tf.where(mask, dy, zeros)
 
 
-@lq.utils.register_keras_custom_object
-@lq.utils.set_precision(1)
-def magnitude_aware_sign_unclipped(x):
+@utils.register_keras_custom_object
+@utils.set_precision(1)
+def linaer_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, unipolar: bool = False) -> tf.Tensor:
+    r"""N-Bit binarization using linear approximation.
+
+    Supports both unipolar and bipolar quantization at various bitwidths.
+
+    # Arguments
+    x: Input tensor.
+    clip_value: Threshold for clipping gradients. If 'None' gradients are not clipped.
+    bits: Number of bits to quantize to.
+    unipolar: If True, quantize in the range [0, 1]
+
+    # Returns
+    Binarized tensor.
     """
-    Scaled sign function with identity pseudo-gradient as used for the
-    weights in DoReFa and XNORNet papers. The Scale factor is calculated per layer.
-    """
-    scale_factor = tf.stop_gradient(tf.reduce_mean(tf.abs(x)))
+    bit_constant = (2**bits) - 1
+    @tf.custom_gradient
+    def _bipolar_call(x):
+        def grad(dy):
+            return _clipped_gradient(x, dy, clip_value, False)
+
+        # Force appropriate range
+        qx = tf.clip_by_value(x, -1, 1)
+        # Adjust to [0, 1] range
+        qx = (qx + 1) / 2
+        # Quantize in available bins.
+        qx = tf.round(bit_constant * qx) / bit_constant
+        # Readjust to [-1, 1]
+        qx = 2 * (qx - 0.5)
+
+        return qx, grad
 
     @tf.custom_gradient
-    def _magnitude_aware_sign(x):
-        return lq.math.sign(x) * scale_factor, lambda dy: dy
+    def _unipolar_call(x):
+        def grad(dy):
+            return _clipped_gradient(x, dy, clip_value, True)
 
-    return _magnitude_aware_sign(x)
+        # Force appropriate range
+        qx = tf.clip_by_value(x, 0, 1)
+        # Quantize in available bins
+        qx = tf.round(bit_constant * qx) / bit_constant
 
+        return qx, grad
 
-def compute_quantized_shiftnorm(
-    variance,
-    mean,
-    epsilon,
-    latent_weights,
-    extra_scale,
-    bits,
-    offset=None,
-    scale=None,
-    rescale=True,
-):
-    """Computes approximated shiftnorm deviation and mean."""
-    # Compute number of bits to shift for std division.
-    std_factor = 1.0 / (extra_scale * tf.sqrt(variance + epsilon))
-    approximate_std = AP2(std_factor)
-    # Now determine total number of bits needed for fixed point quantization of mean.
-    weight_scale_ap2 = AP2(tf.reduce_mean(tf.abs(latent_weights)))
-    weight_scale_bits = -log2(weight_scale_ap2)
-    weight_scale_bits = tf.reshape(weight_scale_bits, [-1])
-    shift_bits = weight_scale_bits + bits
-
-    # Determine quantization scale based on geometric series.
-    mean_scale = 1.0 + ((1.0 / (2.0 ** bits - 1.0)) * (1.0 - (1.0 / 2.0 ** weight_scale_bits)))
-
-    # Now quantize each channel of mean appropriately
-    quantized_means = FixedPointQuantize(mean, mean_scale, shift_bits, rescale)
-
-    total_bits = shift_bits - log2(approximate_std)
-
-    # Calculate approximate scale and offset as well if specified.
-    if offset is not None:
-        quantized_offset = FixedPointQuantize(offset, mean_scale, shift_bits, rescale)
-        quantized_means = quantized_means - quantized_offset
-    if scale is not None:
-        approximate_scale = AP2(scale)
-        approximate_std = approximate_std * approximate_scale
-        total_bits = total_bits - log2(approximate_scale)
-
-    return approximate_std, quantized_means, total_bits
+    if unipolar:
+        return _unipolar_call(x)
+    return _bipolar_call(x)
 
 
-def quantize_residual(residual, bits, total_bits, rescale=True):
-    """Quantizes the output of a shiftnorm layer so it can be used in a skip connection."""
-    scale = 1.0 + ((1.0 / (2.0 ** bits - 1.0)) * (1.0 - (1.0 / 2.0 ** total_bits)))
-    return FixedPointQuantize(residual, scale, total_bits, rescale)
-
-
-def get_shiftnorm_ap2(layer, latent_weights, rescale=False):
-    """Helper function for extracting std and mean from shiftnorm layer."""
-    mean = layer.weights[0].value()
-    extra_scale = layer.extra_scale
-    epsilon = layer.epsilon
-    variance = layer.weights[1].value()
-    bits = layer.bits
-    approximate_std, quantized_means, total_bits = compute_quantized_shiftnorm(
-        variance, mean, epsilon, latent_weights, extra_scale, bits, rescale
-    )
-    return approximate_std, quantized_means, total_bits
+@utils.register_keras_custom_object
+class LinearQuantizer(QuantizerFunctionWrapper):
+    def __init__(self, bits: int, clip_value: float = 1.0, unipolar: bool = False):
+        super().__init__(linaer_quantize_ste, bits=bits, clip_value=clip_value, unipolar=unipolar)
+        self.bits = bits
+        self.clip_value = clip_value
+        self.unipolar = unipolar
 
 
 class BatchNormalization(keras.layers.BatchNormalization):
@@ -131,6 +108,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
     Arguments:
     latent_weights: Tensor, the weights of the previous layer.
     bits: Integer, How many bits activations are quantized with.
+    unipolar: If true then unipolar quantization is being used, otherwise bipolar.
     use_shiftnorm: Bool, whether to use shiftnorm or regular batchnorm.
     axis: Integer, the axis that should be normalized
         (typically the features axis).
@@ -183,9 +161,10 @@ class BatchNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, bits, use_shiftnorm=True, **kwargs):
+    def __init__(self, bits, unipolar=False, use_shiftnorm=True, **kwargs):
         super(BatchNormalization, self).__init__(**kwargs)
         self.bits = bits
+        self.unipolar = unipolar 
         self.use_shiftnorm = use_shiftnorm
         self.fused = False
 
@@ -306,8 +285,8 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 return self._assign_moving_average(var, value, self.momentum, inputs_size)
 
             def mean_update():
-                true_branch = lambda: _do_update(self.moving_mean, new_mean)
-                false_branch = lambda: self.moving_mean
+                def true_branch(): return _do_update(self.moving_mean, new_mean)
+                def false_branch(): return self.moving_mean
                 return tf_utils.smart_cond(training, true_branch, false_branch)
 
             def variance_update():
@@ -329,9 +308,9 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 if self.renorm:
                     true_branch = true_branch_renorm
                 else:
-                    true_branch = lambda: _do_update(self.moving_variance, new_variance)
+                    def true_branch(): return _do_update(self.moving_variance, new_variance)
 
-                false_branch = lambda: self.moving_variance
+                def false_branch(): return self.moving_variance
                 return tf_utils.smart_cond(training, true_branch, false_branch)
 
             self.add_update(mean_update)
@@ -352,11 +331,11 @@ class BatchNormalization(keras.layers.BatchNormalization):
         if offset is not None:
             adjusted_offset = offset * std
             mean = mean - adjusted_offset
-        
+
         # Quantize std and mean.
         std = 1 / std
         std = AP2(std)
-        mean = smooth_round(mean)
+        mean = (2**self.bits * smooth_round(mean)) / (2 ** self.bits)
 
         outputs = (inputs - _broadcast(mean)) * _broadcast(std)
 
