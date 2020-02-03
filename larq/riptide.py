@@ -41,7 +41,7 @@ def _clipped_gradient(x, dy, clip_value, unipolar):
 
 @utils.register_keras_custom_object
 @utils.set_precision(1)
-def linaer_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, unipolar: bool = False) -> tf.Tensor:
+def linear_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, unipolar: bool = False) -> tf.Tensor:
     r"""N-Bit binarization using linear approximation.
 
     Supports both unipolar and bipolar quantization at various bitwidths.
@@ -92,7 +92,7 @@ def linaer_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, un
 @utils.register_keras_custom_object
 class LinearQuantizer(QuantizerFunctionWrapper):
     def __init__(self, bits: int, clip_value: float = 1.0, unipolar: bool = False):
-        super().__init__(linaer_quantize_ste, bits=bits, clip_value=clip_value, unipolar=unipolar)
+        super().__init__(linear_quantize_ste, bits=bits, clip_value=clip_value, unipolar=unipolar)
         self.bits = bits
         self.clip_value = clip_value
         self.unipolar = unipolar
