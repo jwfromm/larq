@@ -41,7 +41,9 @@ def _clipped_gradient(x, dy, clip_value, unipolar):
 
 @utils.register_keras_custom_object
 @utils.set_precision(1)
-def linear_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, unipolar: bool = False) -> tf.Tensor:
+def linear_quantize_ste(
+    x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, unipolar: bool = False
+) -> tf.Tensor:
     r"""N-Bit binarization using linear approximation.
 
     Supports both unipolar and bipolar quantization at various bitwidths.
@@ -55,7 +57,8 @@ def linear_quantize_ste(x: tf.Tensor, bits: int = 1, clip_value: float = 1.0, un
     # Returns
     Binarized tensor.
     """
-    bit_constant = (2**bits) - 1
+    bit_constant = (2 ** bits) - 1
+
     @tf.custom_gradient
     def _bipolar_call(x):
         def grad(dy):
@@ -107,7 +110,8 @@ class BatchNormalization(keras.layers.BatchNormalization):
 
     Arguments:
     latent_weights: Tensor, the weights of the previous layer.
-    bits: Integer, How many bits activations are quantized with.
+    activation_bits: Integer, How many bits activations are quantized with.
+    weight_bits: Integer, how many bits weights are quantized with.
     unipolar: If true then unipolar quantization is being used, otherwise bipolar.
     use_shiftnorm: Bool, whether to use shiftnorm or regular batchnorm.
     axis: Integer, the axis that should be normalized
@@ -161,10 +165,13 @@ class BatchNormalization(keras.layers.BatchNormalization):
         Internal Covariate Shift](https://arxiv.org/abs/1502.03167)
     """
 
-    def __init__(self, bits, unipolar=False, use_shiftnorm=True, **kwargs):
+    def __init__(
+        self, activation_bits=1, weight_bits=1, unipolar=False, use_shiftnorm=True, **kwargs
+    ):
         super(BatchNormalization, self).__init__(**kwargs)
-        self.bits = bits
-        self.unipolar = unipolar 
+        self.activation_bits = activation_bits
+        self.weight_bits = weight_bits
+        self.unipolar = unipolar
         self.use_shiftnorm = use_shiftnorm
         self.fused = False
 
@@ -201,11 +208,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
         broadcast_shape[self.axis[0]] = input_shape.dims[self.axis[0]].value
 
         def _broadcast(v):
-            if (
-                v is not None
-                and len(v.shape) != ndims
-                and reduction_axes != list(range(ndims - 1))
-            ):
+            if v is not None and len(v.shape) != ndims and reduction_axes != list(range(ndims - 1)):
                 return tf.reshape(v, broadcast_shape)
             return v
 
@@ -285,8 +288,12 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 return self._assign_moving_average(var, value, self.momentum, inputs_size)
 
             def mean_update():
-                def true_branch(): return _do_update(self.moving_mean, new_mean)
-                def false_branch(): return self.moving_mean
+                def true_branch():
+                    return _do_update(self.moving_mean, new_mean)
+
+                def false_branch():
+                    return self.moving_mean
+
                 return tf_utils.smart_cond(training, true_branch, false_branch)
 
             def variance_update():
@@ -308,9 +315,12 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 if self.renorm:
                     true_branch = true_branch_renorm
                 else:
-                    def true_branch(): return _do_update(self.moving_variance, new_variance)
+                    def true_branch():
+                        return _do_update(self.moving_variance, new_variance)
 
-                def false_branch(): return self.moving_variance
+                def false_branch():
+                    return self.moving_variance
+
                 return tf_utils.smart_cond(training, true_branch, false_branch)
 
             self.add_update(mean_update)
@@ -335,7 +345,8 @@ class BatchNormalization(keras.layers.BatchNormalization):
         # Quantize std and mean.
         std = 1 / std
         std = AP2(std)
-        mean = smooth_round((2**self.bits - 1) * mean) / (2 ** self.bits - 1)
+        bit_constant = (2 ** (self.activation_bits * self.weight_bits)) - 1
+        mean = smooth_round(bit_constant * mean) / bit_constant
 
         outputs = (inputs - _broadcast(mean)) * _broadcast(std)
 
