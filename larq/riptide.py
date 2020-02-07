@@ -95,11 +95,108 @@ def linear_quantize_ste(
 @utils.register_keras_custom_object
 class LinearQuantizer(QuantizerFunctionWrapper):
     def __init__(self, bits: int, clip_value: float = 1.0, unipolar: bool = False):
-        super().__init__(linear_quantize_ste, bits=bits, clip_value=clip_value, unipolar=unipolar)
         self.bits = bits
         self.clip_value = clip_value
         self.unipolar = unipolar
+        super().__init__(linear_quantize_ste, bits=bits, clip_value=clip_value, unipolar=unipolar)
 
+
+@tf.custom_gradient
+def AlphaClip(x, alpha):
+    output = tf.clip_by_value(x, 0, alpha)
+
+    def grad_fn(dy):
+        x_grad_mask = tf.cast(tf.logical_and(x >= 0, x <= alpha), tf.float32)
+        alpha_grad_mask = tf.cast(x >= alpha, tf.float32)
+        alpha_grad = tf.reduce_sum(dy * alpha_grad_mask)
+        x_grad = dy * x_grad_mask
+
+        return [x_grad, alpha_grad]
+
+    return output, grad_fn
+
+
+@tf.custom_gradient
+def AlphaQuantize(x, alpha, bits):
+    output = tf.round(x * ((2**bits - 1) / alpha)) * (alpha / (2**bits - 1))
+
+    def grad_fn(dy):
+        return [dy, None, None]
+
+    return output, grad_fn
+
+
+class PACT(tf.keras.layers.Layer):
+    def __init__(self, bits = 2):
+        super(PACT, self).__init__()
+        self.bits = float(bits)
+
+    def build(self, input_shape):
+        self.alpha = self.add_variable(
+            'alpha',
+            shape=[],
+            initializer=tf.initializers.Constant([10.]),
+            regularizer=tf.keras.regularizers.l2(0.0002))
+
+    def call(self, inputs):
+        outputs = AlphaClip(inputs, self.alpha)
+        outputs = AlphaQuantize(outputs, self.alpha, self.bits)
+        return outputs
+
+    def get_config(self):
+        return {'quantize': self.quantize, 'bits': self.bits}
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+@utils.register_keras_custom_object
+class PACTQuantizer(QuantizerFunctionWrapper):
+    def __init__(self, bits: int = 2):
+        self.bits = bits
+        self.pact = PACT(self.bits)
+        super().__init__(self.pact)
+
+
+def get_sawb_coefficients(bits):
+    bits = int(bits)
+    coefficient_dict = {1: [0., 1.], 2: [3.19, -2.14], 3: [7.40, -6.66], 4: [11.86, -11.68],
+                        5: [17.08, -17.66], 6: [22.49, -23.95], 7: [28.68, -31.24],
+                        8: [32.27, -35.46], 16: [34.26, -37.60], 32: [40.60, -45.33]}
+    return coefficient_dict[bits]
+
+
+@utils.register_keras_custom_object
+@utils.set_precision(1)
+def SAWB(x: tf.Tensor, bits: int = 2) -> tf.Tensor:
+    # Compute alpha
+    c1, c2 = get_sawb_coefficients(bits)
+    bits = float(bits)
+
+    @tf.custom_gradient
+    def _call(x):
+        alpha = c1 * tf.sqrt(tf.reduce_mean(x ** 2)) + c2 * tf.reduce_mean(tf.abs(x))
+        # Clip between -alpha and alpha
+        clipped = tf.clip_by_value(x, -alpha, alpha)
+        # Rescale to [0, alpha]
+        scaled = (clipped + alpha) / 2.
+        # Quantize.
+        quantized = tf.round(scaled * ((2**bits - 1) / alpha)) * (alpha /
+                                                                (2**bits - 1))
+        # Rescale to negative range.
+        output = (2 * quantized) - alpha
+
+        return output, lambda dy: dy
+
+    return _call(x)
+
+
+@utils.register_keras_custom_object
+class SAWBQuantizer(QuantizerFunctionWrapper):
+    def __init__(self, bits: int = 2):
+        self.bits = bits
+        super().__init__(SAWB, bits=bits)
+        
 
 class BatchNormalization(keras.layers.BatchNormalization):
     """Shift normalization layer
@@ -315,6 +412,7 @@ class BatchNormalization(keras.layers.BatchNormalization):
                 if self.renorm:
                     true_branch = true_branch_renorm
                 else:
+
                     def true_branch():
                         return _do_update(self.moving_variance, new_variance)
 
